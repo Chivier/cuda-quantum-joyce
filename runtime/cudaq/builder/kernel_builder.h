@@ -179,6 +179,8 @@ CUDAQ_DETAILS_QIS_DECLARATION(z)
 
 #define CUDAQ_DETAILS_ONEPARAM_QIS_DECLARATION(NAME)                           \
   void NAME(ImplicitLocOpBuilder &builder, QuakeValue &parameter,              \
+            std::vector<QuakeValue> &ctrls, QuakeValue &target);               \
+  void NAME(ImplicitLocOpBuilder &builder, double &parameter,                  \
             std::vector<QuakeValue> &ctrls, QuakeValue &target);
 
 CUDAQ_DETAILS_ONEPARAM_QIS_DECLARATION(rx)
@@ -473,6 +475,11 @@ public:
   void NAME(QuakeValue parameter, std::vector<QuakeValue> &ctrls,              \
             QuakeValue &target) {                                              \
     details::NAME(*opBuilder, parameter, ctrls, target);                       \
+  }                                                                            \
+  void NAME(double parameter, std::vector<QuakeValue> &ctrls,                  \
+            QuakeValue &target) {                                              \
+    QuakeValue v(*opBuilder, parameter);                                       \
+    details::NAME(*opBuilder, v, ctrls, target);                               \
   }                                                                            \
   void NAME(double param, QuakeValue qubit) {                                  \
     std::vector<QuakeValue> empty;                                             \
