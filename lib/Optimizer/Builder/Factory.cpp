@@ -7,12 +7,52 @@
  ******************************************************************************/
 
 #include "cudaq/Optimizer/Builder/Factory.h"
+#include "cudaq/Optimizer/CodeGen/QIRFunctionNames.h"
 #include "cudaq/Optimizer/Dialect/CC/CCOps.h"
 #include "cudaq/Optimizer/Dialect/Quake/QuakeOps.h"
 
 using namespace mlir;
 
 namespace cudaq::opt {
+
+/// Return an i64 array where the kth element is N if the kth
+/// operand is veq<N> and 0 otherwise (e.g. is a ref).
+Value factory::packIsArrayAndLengthArray(Location loc,
+                                         ConversionPatternRewriter &rewriter,
+                                         ModuleOp parentModule,
+                                         Value numOperands,
+                                         ValueRange operands) {
+  // Create an integer array where the kth element is N if the kth
+  // control operand is a veq<N>, and 0 otherwise.
+  auto i64Type = rewriter.getI64Type();
+  auto context = rewriter.getContext();
+  Value isArrayAndLengthArr = rewriter.create<LLVM::AllocaOp>(
+      loc, LLVM::LLVMPointerType::get(i64Type), numOperands);
+  auto intPtrTy = LLVM::LLVMPointerType::get(i64Type);
+  Value zero = rewriter.create<arith::ConstantIntOp>(loc, 0, 64);
+  auto getSizeSymbolRef = cudaq::opt::factory::createLLVMFunctionSymbol(
+      cudaq::opt::QIRArrayGetSize, i64Type, {cudaq::opt::getArrayType(context)},
+      parentModule);
+  for (auto iter : llvm::enumerate(operands)) {
+    auto operand = iter.value();
+    auto i = iter.index();
+    Value idx = rewriter.create<arith::ConstantIntOp>(loc, i, 64);
+    Value ptr = rewriter.create<LLVM::GEPOp>(loc, intPtrTy, isArrayAndLengthArr,
+                                             ValueRange{idx});
+    Value element;
+    if (operand.getType() == cudaq::opt::getQubitType(context))
+      element = zero;
+    else
+      // get array size with the runtime function
+      element = rewriter
+                    .create<LLVM::CallOp>(loc, rewriter.getI64Type(),
+                                          getSizeSymbolRef, ValueRange{operand})
+                    .getResult();
+
+    rewriter.create<LLVM::StoreOp>(loc, element, ptr);
+  }
+  return isArrayAndLengthArr;
+}
 
 FlatSymbolRefAttr factory::createLLVMFunctionSymbol(StringRef name,
                                                     Type retType,
@@ -109,17 +149,40 @@ cudaq::cc::LoopOp factory::createInvariantLoop(
 }
 
 bool factory::hasHiddenSRet(FunctionType funcTy) {
-  return funcTy.getNumResults() == 1 &&
-         funcTy.getResult(0).isa<cudaq::cc::StdvecType>();
+  // If a function has more than 1 result, the results are promoted to a
+  // structured return argument. Otherwise, if there is 1 result and it is an
+  // aggregate type, then it is promoted to a structured return argument.
+  auto numResults = funcTy.getNumResults();
+  return numResults > 1 ||
+         (numResults == 1 &&
+          funcTy.getResult(0)
+              .isa<cudaq::cc::StdvecType, cudaq::cc::StructType,
+                   cudaq::cc::ArrayType, cudaq::cc::CallableType>());
 }
 
 // FIXME: We should get the underlying structure of a std::vector from the
 // AST. For expediency, we just construct the expected type directly here.
-static cudaq::cc::StructType stlVectorType(Type eleTy) {
+cudaq::cc::StructType factory::stlVectorType(Type eleTy) {
   MLIRContext *ctx = eleTy.getContext();
   auto elePtrTy = cudaq::cc::PointerType::get(eleTy);
   SmallVector<Type> eleTys = {elePtrTy, elePtrTy, elePtrTy};
   return cudaq::cc::StructType::get(ctx, eleTys);
+}
+
+cudaq::cc::StructType factory::getDynamicBufferType(MLIRContext *ctx) {
+  auto ptrTy = cudaq::cc::PointerType::get(IntegerType::get(ctx, 8));
+  return cudaq::cc::StructType::get(
+      ctx, ArrayRef<Type>{ptrTy, IntegerType::get(ctx, 64)});
+}
+
+Type factory::getSRetElementType(FunctionType funcTy) {
+  assert(funcTy.getNumResults() && "function type must have results");
+  auto *ctx = funcTy.getContext();
+  if (funcTy.getNumResults() > 1)
+    return cudaq::cc::StructType::get(ctx, funcTy.getResults());
+  if (isa<cudaq::cc::StdvecType>(funcTy.getResult(0)))
+    return getDynamicBufferType(ctx);
+  return funcTy.getResult(0);
 }
 
 FunctionType factory::toCpuSideFuncType(FunctionType funcTy, bool addThisPtr) {
@@ -128,21 +191,22 @@ FunctionType factory::toCpuSideFuncType(FunctionType funcTy, bool addThisPtr) {
   // argument to the kernel entry function. The CUDA Quantum language spec
   // doesn't allow the kernel object to contain data members (yet), so we can
   // ignore the `this` pointer.
-  auto ptrTy = cudaq::cc::PointerType::get(IntegerType::get(ctx, 8));
   SmallVector<Type> inputTys;
-  // If this kernel is a plain old function or a static member function, we
-  // don't want to add a hidden `this` argument.
-  if (addThisPtr)
-    inputTys.push_back(ptrTy);
   bool hasSRet = false;
   if (factory::hasHiddenSRet(funcTy)) {
     // When the kernel is returning a std::vector<T> result, the result is
     // returned via a sret argument in the first position. When this argument
     // is added, the this pointer becomes the second argument. Both are opaque
     // pointers at this point.
-    inputTys.push_back(ptrTy);
+    auto eleTy = getSRetElementType(funcTy);
+    inputTys.push_back(cudaq::cc::PointerType::get(eleTy));
     hasSRet = true;
   }
+  // If this kernel is a plain old function or a static member function, we
+  // don't want to add a hidden `this` argument.
+  auto ptrTy = cudaq::cc::PointerType::get(IntegerType::get(ctx, 8));
+  if (addThisPtr)
+    inputTys.push_back(ptrTy);
 
   // Add all the explicit (not hidden) arguments after the hidden ones.
   for (auto inTy : funcTy.getInputs()) {

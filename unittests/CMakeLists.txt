@@ -33,6 +33,7 @@ set(CUDAQ_RUNTIME_TEST_SOURCES
   integration/observe_result_tester.cpp
   integration/noise_tester.cpp
   integration/get_state_tester.cpp
+  integration/measure_reset_tester.cpp
   qir/NVQIRTester.cpp
   qis/QubitQISTester.cpp
   integration/kernels_tester.cpp
@@ -70,6 +71,12 @@ macro (create_tests_with_backend NVQIR_BACKEND EXTRA_BACKEND_TESTER)
   if (${NVQIR_BACKEND} STREQUAL "dm")
      target_compile_definitions(${TEST_EXE_NAME} PRIVATE -DCUDAQ_BACKEND_DM)
   endif()
+  if (${NVQIR_BACKEND} STREQUAL "tensornet")
+     target_compile_definitions(${TEST_EXE_NAME} PRIVATE -DCUDAQ_BACKEND_TENSORNET)
+  endif()
+  if (${NVQIR_BACKEND} STREQUAL "tensornet-mps")
+     target_compile_definitions(${TEST_EXE_NAME} PRIVATE -DCUDAQ_BACKEND_TENSORNET -DCUDAQ_BACKEND_TENSORNET_MPS)
+  endif()
   gtest_discover_tests(${TEST_EXE_NAME})
 endmacro()
 
@@ -77,9 +84,6 @@ endmacro()
 create_tests_with_backend(qpp backends/QPPTester.cpp)
 create_tests_with_backend(dm "")
 
-# FIXME Check that we have GPUs. Could be in a 
-# Docker environment built with CUDA, but no --gpus flag
-# or no gpus on the system.
 if (CUSTATEVEC_ROOT AND CUDA_FOUND) 
   create_tests_with_backend(custatevec-fp32 "")
   # Given that the fp32 and fp64 difference is largely inherited
@@ -120,10 +124,16 @@ if (CUSTATEVEC_ROOT AND CUDA_FOUND)
               gtest_main)
             configure_file("mqpu/run_mpi.sh.in"
                       "${CMAKE_BINARY_DIR}/unittests/run_mpi.sh" @ONLY)
-          add_test(NAME MPITest COMMAND ${MPIEXEC} --allow-run-as-root -np 2 ${CMAKE_BINARY_DIR}/unittests/run_mpi.sh)
+          add_test(NAME MPITest COMMAND ${MPIEXEC} --allow-run-as-root -np 2 bash ${CMAKE_BINARY_DIR}/unittests/run_mpi.sh)
         endif()
       endif()
     endif() 
+endif() 
+
+if(TARGET nvqir-tensornet)
+  message(STATUS "Building cutensornet backend tests.")
+  create_tests_with_backend(tensornet "")
+  create_tests_with_backend(tensornet-mps "")
 endif() 
 
 # Create an executable for SpinOp UnitTests
@@ -168,6 +178,32 @@ target_link_libraries(test_photonics
   gtest_main)
 gtest_discover_tests(test_photonics)
 
+# Create an executable for MPI UnitTests
+# (only if MPI was found, i.e., the builtin plugin is available)
+if (MPI_CXX_FOUND)
+  set(CUDAQ_MPI_TEST_SOURCES 
+    mpi/mpi_tester.cpp
+  )
+  add_executable(test_mpi_plugin ${CUDAQ_MPI_TEST_SOURCES})
+  set(NUM_PROCS 4)
+  target_compile_definitions(test_mpi_plugin PRIVATE -DNUM_PROCS=${NUM_PROCS})
+  target_link_libraries(test_mpi_plugin
+    PRIVATE 
+    cudaq
+    cudaq-platform-default
+    nvqir-qpp
+    gtest
+  )
+  target_link_options(test_mpi_plugin PRIVATE -Wl,--no-as-needed)
+  # Check if `--allow-run-as-root` is supported (OpenMPI)
+  # Note: MPICH doesn't need `--allow-run-as-root`.
+  execute_process(COMMAND ${MPIEXEC} --allow-run-as-root -np ${NUM_PROCS} hostname ERROR_VARIABLE CHECK_ALLOW_RUN_AS_ROOT_RESULTS ERROR_STRIP_TRAILING_WHITESPACE OUTPUT_QUIET)
+  if ("${CHECK_ALLOW_RUN_AS_ROOT_RESULTS}" STREQUAL "")
+    set(MPI_EXEC_CMD_ARGS "--allow-run-as-root")
+  endif()
+  
+  add_test(NAME MPIApiTest COMMAND ${MPIEXEC} ${MPI_EXEC_CMD_ARGS} -np ${NUM_PROCS} ${CMAKE_BINARY_DIR}/unittests/test_mpi_plugin)
+endif()
 
 add_subdirectory(backends)
 add_subdirectory(Optimizer)

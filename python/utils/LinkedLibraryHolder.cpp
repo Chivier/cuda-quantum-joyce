@@ -30,6 +30,37 @@ constexpr static const char NVQIR_SIMULATION_BACKEND[] =
     "NVQIR_SIMULATION_BACKEND=";
 constexpr static const char TARGET_DESCRIPTION[] = "TARGET_DESCRIPTION=";
 
+/// @brief A utility function to check availability of Nvidia GPUs and return
+/// their count
+int countGPUs() {
+  int retCode = std::system("nvidia-smi >/dev/null 2>&1");
+  if (0 != retCode) {
+    cudaq::info("nvidia-smi: command not found");
+    return -1;
+  }
+
+  char tmpFile[] = "/tmp/.cmd.capture.XXXXXX";
+  int fileDescriptor = mkstemp(tmpFile);
+  if (-1 == fileDescriptor) {
+    cudaq::info("Failed to create a temporary file to capture output");
+    return -1;
+  }
+
+  std::string command = "nvidia-smi -L 2>/dev/null | wc -l >> ";
+  command.append(tmpFile);
+  retCode = std::system(command.c_str());
+  if (0 != retCode) {
+    cudaq::info("Encountered error while invoking 'nvidia-smi'");
+    return -1;
+  }
+
+  std::stringstream buffer;
+  buffer << std::ifstream(tmpFile).rdbuf();
+  close(fileDescriptor);
+  unlink(tmpFile);
+  return std::stoi(buffer.str());
+}
+
 std::size_t RuntimeTarget::num_qpus() {
   auto &platform = cudaq::get_platform();
   return platform.num_qpus();
@@ -38,7 +69,8 @@ std::size_t RuntimeTarget::num_qpus() {
 /// @brief Search the targets folder in the install for available targets.
 void findAvailableTargets(
     const std::filesystem::path &targetPath,
-    std::unordered_map<std::string, RuntimeTarget> &targets) {
+    std::unordered_map<std::string, RuntimeTarget> &targets,
+    std::unordered_map<std::string, RuntimeTarget> &simulationTargets) {
 
   // Loop over all target files
   for (const auto &configFile :
@@ -46,7 +78,7 @@ void findAvailableTargets(
     auto path = configFile.path();
     // They must have a .config suffix
     if (path.extension().string() == ".config") {
-
+      bool isSimulationTarget = false;
       // Extract the target name from the file name
       auto fileName = path.filename().string();
       auto targetName = std::regex_replace(fileName, std::regex(".config"), "");
@@ -67,6 +99,7 @@ void findAvailableTargets(
                 std::regex_replace(platformName, std::regex("-"), "_");
 
           } else if (line.find(NVQIR_SIMULATION_BACKEND) != std::string::npos) {
+            isSimulationTarget = true;
             cudaq::trim(line);
             simulatorName = cudaq::split(line, '=')[1];
             // Post-process the string
@@ -91,6 +124,14 @@ void findAvailableTargets(
       // Add the target.
       targets.emplace(targetName, RuntimeTarget{targetName, simulatorName,
                                                 platformName, description});
+      if (isSimulationTarget) {
+        cudaq::info("Found Simulation target: {} -> (sim={}, platform={})",
+                    targetName, simulatorName, platformName);
+        simulationTargets.emplace(targetName,
+                                  RuntimeTarget{targetName, simulatorName,
+                                                platformName, description});
+        isSimulationTarget = false;
+      }
     }
   }
 }
@@ -116,7 +157,7 @@ LinkedLibraryHolder::LinkedLibraryHolder() {
 
   // Populate the map of available targets.
   auto targetPath = cudaqLibPath.parent_path() / "targets";
-  findAvailableTargets(targetPath, targets);
+  findAvailableTargets(targetPath, targets, simulationTargets);
 
   cudaq::info("Init: Library Path is {}.", cudaqLibPath.string());
 
@@ -212,16 +253,32 @@ LinkedLibraryHolder::LinkedLibraryHolder() {
     }
   }
 
-  targets.emplace("qpp-cpu",
-                  RuntimeTarget{"qpp-cpu", "qpp", "default",
-                                "QPP-based CPU-only simulated QPU."});
+  // Set the default target
+  // If environment variable set with a valid value, use it
+  // Otherwise, if GPU(s) available, set default to 'nvidia', else to 'qpp-cpu'
+  defaultTarget = "qpp-cpu";
+  if (countGPUs() > 0) {
+    defaultTarget = "nvidia";
+  }
+  auto env = std::getenv("CUDAQ_DEFAULT_SIMULATOR");
+  if (env) {
+    cudaq::info("'CUDAQ_DEFAULT_SIMULATOR' = {}", env);
+    auto iter = simulationTargets.find(env);
+    if (iter != simulationTargets.end()) {
+      cudaq::info("Valid target");
+      defaultTarget = iter->second.name;
+    }
+  }
+
+  // Initialize current target to default, may be overridden by command line
+  // argument or set_target() API
+  currentTarget = defaultTarget;
 
   if (disallowTargetModification)
     return;
 
-  // We'll always start off with the default platform and the QPP simulator
-  __nvqir__setCircuitSimulator(getSimulator("qpp"));
-  setQuantumPlatformInternal(getPlatform("default"));
+  // We'll always start off with the default target
+  resetTarget();
 }
 
 LinkedLibraryHolder::~LinkedLibraryHolder() {
@@ -253,7 +310,7 @@ LinkedLibraryHolder::getPlatform(const std::string &platformName) {
       std::string("getQuantumPlatform_") + platformName);
 }
 
-void LinkedLibraryHolder::resetTarget() { setTarget("qpp-cpu"); }
+void LinkedLibraryHolder::resetTarget() { setTarget(defaultTarget); }
 
 RuntimeTarget LinkedLibraryHolder::getTarget(const std::string &name) const {
   auto iter = targets.find(name);
